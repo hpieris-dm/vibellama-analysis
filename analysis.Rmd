@@ -1,0 +1,549 @@
+---
+output:
+  word_document: default
+  html_notebook:
+    df_print: paged
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# Setup knitr options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+## Load Libraries and Data
+
+```{r load-libraries}
+# Install and load required packages
+pkgs <- c("readr", "dplyr", "tidyr", "ggplot2", "gridExtra", "ARTool", "boot", "reshape2", "viridis", "knitr", "kableExtra")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+
+# Read merged results CSV and prepare factors
+df <- readr::read_csv("merged_results.csv") %>%
+  dplyr::mutate(
+    size  = factor(paste0(size, "B"), levels = c("1B","3B","11B")),
+    quant = factor(quant, levels = c("bf16","4bit"))
+  )
+
+```
+
+## 1. Assumption Checks & Statistical Approach
+
+### 1.1 Shapiro–Wilk Normality Test
+
+```{r shapiro-test}
+# Subset 4-bit fine-tuned adapters only
+df_ft <- dplyr::filter(df, quant == "4bit", !is.na(seed))
+
+# Fit one-way ANOVA and extract residuals
+aov_model <- stats::aov(accuracy ~ size, data = df_ft)
+resid_ft <- stats::residuals(aov_model)
+
+# Shapiro–Wilk test for normality of residuals
+stats::shapiro.test(resid_ft)
+```
+
+### 1.2 Kruskal–Wallis One-Way Test
+
+```{r kruskal-test}
+# Non-parametric one-way test on accuracy by size
+stats::kruskal.test(accuracy ~ size, data = df_ft)
+```
+### 1.3 Pairwise Wilconxon Test
+```{r posthoc-wilcox}
+# Pairwise comparisons of accuracy between adapter sizes
+stats::pairwise.wilcox.test(
+  x = df_ft$accuracy,
+  g = df_ft$size,
+  p.adjust.method = "bonferroni"
+)
+```
+
+### 1.4 Aligned-Rank Transform Two-Way ANOVA (ART)
+
+```{r art-anova}
+# Fit ART model for main effects and interaction
+art_model <- ARTool::art(accuracy ~ size * quant, data = df)
+stats::anova(art_model)
+```
+
+## 2. Chart Generation
+
+### 2.1 Bootstrap Confidence Interval Function
+
+```{r bootstrap-function}
+# Function to compute 99% bootstrap CI manually
+bootstrap_ci <- function(x, n = 2000, alpha = 0.01) {
+  # Draw bootstrap samples of means
+  boot_means <- replicate(n, mean(sample(x, replace = TRUE)))
+  # Compute percentile CI
+  ci <- quantile(boot_means, probs = c(alpha/2, 1 - alpha/2))
+  return(ci)
+}
+```
+
+### 2.2 Figure 1: Mean Accuracy & F1 with 99% Bootstrap CIs for 4BIT Fine-tuned Models
+
+```{r fig1-accuracy-f1}
+# Compute manual bootstrap-percentile CIs to avoid constant-data errors
+boot_ci <- function(x, R=2000, alpha=0.01) {
+  boots <- replicate(R, mean(sample(x, replace=TRUE)))
+  qs   <- quantile(boots, probs=c(alpha/2, 1-alpha/2))
+  return(c(lower=qs[1], upper=qs[2]))
+}
+
+# Summarize means + CIs for 4-bit adapters only
+data_summary <- df %>%
+  filter(quant == "4bit", !is.na(seed)) %>%
+  group_by(size) %>%
+  summarise(
+    acc_mean    = mean(accuracy),
+    acc_ci_low  = boot_ci(accuracy)["lower"],
+    acc_ci_high = boot_ci(accuracy)["upper"],
+    f1_mean     = mean(f1),
+    f1_ci_low   = boot_ci(f1)["lower"],
+    f1_ci_high  = boot_ci(f1)["upper"],
+    .groups      = "drop"
+  )
+
+# Plot Accuracy with error bars
+p1 <- ggplot(data_summary, aes(x = size, y = acc_mean)) +
+  geom_col(fill = "#66c2a5") +
+  geom_errorbar(aes(ymin = acc_ci_low, ymax = acc_ci_high),
+                width = 0.2) +
+  labs(y = "Mean Accuracy ±99% CI", x = "Model Size") +
+  theme_minimal()
+
+# Plot F1 with error bars
+p2 <- ggplot(data_summary, aes(x = size, y = f1_mean)) +
+  geom_col(fill = "#fc8d62") +
+  geom_errorbar(aes(ymin = f1_ci_low, ymax = f1_ci_high),
+                width = 0.2) +
+  labs(y = "Mean F1 ±99% CI", x = "Model Size") +
+  theme_minimal()
+
+# Arrange side by side
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+data_summary
+
+```
+
+### 2.3 Figure 2: Seed-Rep Variability (4-bit FT) Figure 2: Seed-Rep Variability (4-bit FT)
+
+```{r fig2-variability}
+# Boxplots for accuracy and F1 by size
+gg1 <- ggplot(data=df_ft, aes(x = size, y = accuracy)) +
+  geom_boxplot(fill = '#66c2a5') +
+  labs(y = 'Accuracy', x = 'Model Size') +
+  ggtitle('Accuracy Variability (4-bit FT)') +
+  theme_minimal()
+
+gg2 <- ggplot(data=df_ft, aes(x = size, y = f1)) +
+  geom_boxplot(fill = '#fc8d62') +
+  labs(y = 'F1', x = 'Model Size') +
+  ggtitle('F1 Variability (4-bit FT)') +
+  theme_minimal()
+
+gridExtra::grid.arrange(gg1, gg2, ncol = 1)
+
+summary_tbl <- df_ft %>%
+  group_by(size) %>%
+  summarize(
+    acc_min    = min(accuracy),
+    acc_q1     = quantile(accuracy, 0.25),
+    acc_median = median(accuracy),
+    acc_q3     = quantile(accuracy, 0.75),
+    acc_max    = max(accuracy),
+    f1_min     = min(f1),
+    f1_q1      = quantile(f1, 0.25),
+    f1_median  = median(f1),
+    f1_q3      = quantile(f1, 0.75),
+    f1_max     = max(f1),
+    .groups = "drop"
+  )
+
+# Render as a styled table
+summary_tbl %>%
+  kable(
+    format  = "html",
+    digits  = 3,
+    caption = "Table: Accuracy & F1 Summary by Model Size (4-bit Fine-Tuning)"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE) %>%              # Bold the size column
+  column_spec(2:6, width = "1.2cm") %>%        # Set width for accuracy stats
+  column_spec(7:11, width = "1.2cm")           # Set width for F1 stats
+  
+```
+
+### 2.4 Figure 3: Descriptive Interaction Plot
+
+```{r fig3-interaction}
+# Mean accuracy by size & quant
+# Prepare a grouping variable
+df_plot <- df %>%
+  mutate(
+    group = case_when(
+      is.na(seed) & quant == "bf16" ~ "Base BF16",
+      is.na(seed) & quant == "4bit" ~ "Base 4-bit",
+      !is.na(seed) & quant == "4bit" ~ "FT 4-bit"
+    )
+  )
+
+# Plot all three
+ggplot(df_plot, aes(x = size, y = accuracy, color = group, group = group)) +
+  stat_summary(fun = mean, geom = "line", size = 1) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  labs(
+    title = "Mean Accuracy by Size and Model Type",
+    x = "Model Size",
+    y = "Mean Accuracy",
+    color = NULL
+  ) +
+  theme_minimal()
+
+# Compute mean accuracy summary
+summary_tbl2 <- df_plot %>%
+  group_by(size, group) %>%
+  summarize(
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    .groups       = "drop"
+  )
+
+summary_tbl2 %>%
+  kable(
+    format  = "html",
+    digits  = 3,
+    caption = "Mean Accuracy by Model Size and Type"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE) %>%                # Bold the size column
+  column_spec(2, width = "3cm") %>%              # Make group column wider
+  column_spec(3, width = "2.5cm")                # Set width for mean_accuracy
+
+```
+
+### 2.5 Figure 4: Median Accuracy with IQR
+
+```{r fig4-median-iqr}
+# Median accuracy and IQR by size & model group
+df_plot <- df %>%
+  dplyr::mutate(
+    group = dplyr::case_when(
+      is.na(seed) & quant == "bf16" ~ "Base BF16",
+      is.na(seed) & quant == "4bit" ~ "Base 4-bit",
+      !is.na(seed) & quant == "4bit" ~ "FT 4-bit"
+    )
+  )
+
+df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    med   = median(accuracy),
+    q1    = quantile(accuracy, 0.25),
+    q3    = quantile(accuracy, 0.75),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = size, y = med, ymin = q1, ymax = q3, color = group)) +
+    geom_point(size = 3, position = position_dodge(width = 0.4)) +
+    geom_errorbar(
+      position = position_dodge(width = 0.4),
+      width = 0.2
+    ) +
+    labs(
+      title = "Median Accuracy and IQR by Model Group",
+      x     = "Model Size",
+      y     = "Median Accuracy",
+      color = NULL
+    ) +
+    theme_minimal()
+
+
+summary_tbl3 <- df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    med = median(accuracy, na.rm = TRUE),
+    q1  = quantile(accuracy, 0.25, na.rm = TRUE),
+    q3  = quantile(accuracy, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+summary_tbl3 %>%
+  kable(
+    format  = "html",
+    digits  = 3,
+    caption = "Median Accuracy and IQR by Model Size and Group"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE) %>%               # Bold the size column
+  column_spec(2, width = "3cm") %>%             # Wider for group names
+  column_spec(3:5, width = "2cm")               # Set width for med, q1, q3
+```
+
+### 2.6 Figure 5: Residual Diagnostics
+
+```{r fig5-residuals}
+# QQ-plot and Residuals vs Fitted for 4-bit adapters
+par(mfrow = c(1, 2))
+# QQ-plot
+qqnorm(resid_ft)
+qqline(resid_ft)
+# Residuals vs Fitted
+plot(fitted(aov_model), resid_ft,
+     xlab = "Fitted Values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, lty = 2)
+# Reset graphics
+par(mfrow = c(1, 1))
+```
+
+### 2.7 Figure 6: Resource Usage by Size & Quant
+
+```{r fig6-resources}
+# GPU & CPU summary by model group
+res_summary <- df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    gpu = mean(gpu_peak_mem_mb),
+    cpu = mean(cpu_rss_mb),
+    .groups = "drop"
+  )
+
+p3 <- ggplot(res_summary, aes(x = size, y = gpu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(
+    y = "GPU Peak Memory (MB)",
+    x = "Model Size",
+    fill = NULL
+  ) +
+  theme_minimal()
+
+p4 <- ggplot(res_summary, aes(x = size, y = cpu, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(
+    y = "CPU RSS Memory (MB)",
+    x = "Model Size",
+    fill = NULL
+  ) +
+  theme_minimal()
+
+gridExtra::grid.arrange(p3, p4, ncol = 2)
+
+res_summary %>%
+  kable(
+    format  = "html",
+    digits  = 1,
+    caption = "GPU Peak & CPU RSS Memory by Model Size and Group"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE)       %>%  # Bold the size column
+  column_spec(2, width = "3cm")     %>%  # Wider group column
+  column_spec(3:4, width = "2.5cm")      # Set width for numeric cols
+
+```
+
+### 2.8 Figure 7: Throughput & Latency Trends
+
+```{r fig7-throughput-latency}
+# Throughput & Latency by size & model group
+tl_summary <- df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    throughput_mean = mean(throughput),
+    latency_mean    = mean(latency),
+    .groups         = "drop"
+  )
+
+p_thr <- ggplot(tl_summary, aes(x = size, y = throughput_mean, color = group, group = group)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Mean Throughput by Model Group",
+    x     = "Model Size",
+    y     = "Throughput (examples/sec)"
+  ) +
+  theme_minimal()
+
+p_lat <- ggplot(tl_summary, aes(x = size, y = latency_mean, color = group, group = group)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Mean Latency by Model Group",
+    x     = "Model Size",
+    y     = "Latency (sec/example)"
+  ) +
+  theme_minimal()
+
+gridExtra::grid.arrange(p_thr, p_lat, ncol = 1)
+
+tl_summary %>%
+  kable(
+    format  = "html",
+    digits  = 2,
+    caption = "Mean Throughput & Latency by Model Size and Group"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE)   %>%  # Bold the size column
+  column_spec(2, width = "3cm") %>%  # Wider group column
+  column_spec(3:4, width = "2.5cm")   # Set width for numeric columns
+
+```
+
+### 2.9 Figure 8: Accuracy vs. Throughput Pareto
+
+```{r fig8-pareto}
+# Pareto scatter: Accuracy vs Throughput by model group
+pareto_df <- df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    acc_mean = mean(accuracy),
+    thr_mean = mean(throughput),
+    .groups  = "drop"
+  )
+
+ggplot(pareto_df, aes(x = thr_mean, y = acc_mean, color = group, shape = size)) +
+  geom_point(size = 3) +
+  labs(
+    title = "Pareto: Accuracy vs Throughput",
+    x     = "Mean Throughput (examples/sec)",
+    y     = "Mean Accuracy",
+    color = NULL
+  ) +
+  theme_minimal()
+
+pareto_df %>%
+  select(size, group, acc_mean, thr_mean) %>%
+  kable(
+    format  = "html",
+    digits  = 3,
+    caption = "Mean Accuracy vs Throughput by Model Size and Group"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE)   %>%  # Bold the size column
+  column_spec(2, width = "3cm") %>%  # Wider group column
+  column_spec(3:4, width = "2.5cm")   # Width for numeric columns
+```
+
+### 2.10 Figure 9: Correlation Heatmap (4-bit FT)
+
+```{r fig9-corr}
+# Correlation heatmap for key metrics, by model group
+# Use the full df_plot so it covers all runs
+corr_mat <- df_plot %>%
+  dplyr::select(accuracy, f1, throughput, latency, gpu_peak_mem_mb, cpu_rss_mb) %>%
+  cor()
+
+# Melt and plot
+mm <- reshape2::melt(corr_mat)
+ggplot(mm, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  viridis::scale_fill_viridis(name = "Correlation") +
+  labs(
+    title = "Correlation Heatmap of Key Metrics",
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Convert to a data frame for printing
+corr_df <- as.data.frame(corr_mat) %>%
+  tibble::rownames_to_column(var = "Metric")
+
+# Render as a styled HTML/PDF table
+corr_df %>%
+  kable(
+    format  = "html",
+    digits  = 2,
+    caption = "Correlation Matrix of Key Metrics"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE) %>%                # Bold the metric names
+  column_spec(2:7, width = "2.5cm") 
+```
+
+### 2.11 Figure 10: Composite Cost-Effectiveness Frontier
+
+```{r fig10-frontier}
+# Composite Cost-Effectiveness Frontier by model group
+frontier_df <- df_plot %>%
+  group_by(size, group) %>%
+  summarise(
+    acc  = mean(accuracy),
+    lat  = mean(latency),
+    mem  = mean(gpu_peak_mem_mb + cpu_rss_mb),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Normalize accuracy to [0,1]
+    norm_acc  = (acc - min(acc)) / (max(acc) - min(acc)),
+    # Define cost = latency + memory/10000, then normalize
+    raw_cost  = lat + mem/10000,
+    norm_cost = (raw_cost - min(raw_cost)) / (max(raw_cost) - min(raw_cost))
+  )
+
+ggplot(frontier_df, aes(x = norm_cost, y = norm_acc, color = group, label = size)) +
+  geom_point(size = 4) +
+  geom_text(nudge_y = 0.02) +
+  labs(
+    title = "Composite Cost-Effectiveness Frontier",
+    x     = "Normalized Cost (lower is better)",
+    y     = "Normalized Accuracy (higher is better)",
+    color = NULL
+  ) +
+  theme_minimal()
+
+frontier_df %>%
+  select(size, group, acc, lat, mem, norm_acc, raw_cost, norm_cost) %>%
+  kable(
+    format  = "html",
+    digits  = 3,
+    caption = "Composite Cost-Effectiveness Frontier Data"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE
+  ) %>%
+  column_spec(1, bold = TRUE)   %>%  # Bold the size column
+  column_spec(2, width = "3cm") %>%  # Wider group column
+  column_spec(3:8, width = "2.5cm")   # Set width for numeric columns
+
+```
+
+
